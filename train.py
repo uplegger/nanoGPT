@@ -20,6 +20,8 @@ import os
 import time
 import math
 import pickle
+import glob
+import random
 from contextlib import nullcontext
 
 import numpy as np
@@ -113,22 +115,51 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+# Per-ticker datasets (e.g. data/returns) ship one {TICKER}.train.bin file per
+# symbol. Vanilla datasets use a single train.bin / val.bin. Detect by glob.
+_PER_TICKER_PATHS = sorted(glob.glob(os.path.join(data_dir, '*.train.bin')))
+_TICKERS = [os.path.basename(p)[:-len('.train.bin')] for p in _PER_TICKER_PATHS]
+if _TICKERS:
+    print(f"per-ticker dataset: {len(_TICKERS)} tickers under {data_dir}")
+    def get_batch(split):
+        # One ticker per batch (B=1, T = ticker history length, capped by
+        # block_size). The "variable batch size" the user wanted is realised
+        # through the T dimension; gradient_accumulation_steps stacks tickers.
+        ticker = random.choice(_TICKERS)
+        path = os.path.join(data_dir, f"{ticker}.{split}.bin")
+        if not os.path.exists(path):
+            return get_batch(split)  # this split may be empty for some tickers
+        data = np.memmap(path, dtype=np.uint16, mode='r')
+        if len(data) < 2:
+            return get_batch(split)
+        arr = np.asarray(data, dtype=np.int64)
+        if len(arr) > block_size + 1:
+            s = random.randint(0, len(arr) - block_size - 1)
+            arr = arr[s:s + block_size + 1]
+        x = torch.from_numpy(arr[:-1])[None, :]
+        y = torch.from_numpy(arr[1:])[None, :]
+        if device_type == 'cuda':
+            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        return x, y
+else:
+    def get_batch(split):
+        # We recreate np.memmap every batch to avoid a memory leak, as per
+        # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+        if split == 'train':
+            data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        else:
+            data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+        if device_type == 'cuda':
+            # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
+            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
